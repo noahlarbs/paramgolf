@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch._dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -1182,6 +1183,10 @@ def main() -> None:
                     # Rebuild optimizer
                     base_model = base_model.to(device).bfloat16()
                     restore_low_dim_params_to_fp32(base_model)
+                    
+                    # Flush the PyTorch compiler cache so Dynamo learns the new FFN shapes from scratch
+                    torch._dynamo.reset()
+                    
                     model = compile_model(base_model)
                     optimizers, optimizer_muon = build_optimizers(base_model)
                     

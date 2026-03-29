@@ -857,6 +857,13 @@ def main() -> None:
     # TOKENIZER + VALIDATION METRIC SETUP
     # -----------------------------
 
+    if master_process and (not os.path.exists(args.tokenizer_path) or not glob.glob(args.val_files)):
+        log0("Auto-downloading the parameter-golf dataset and tokenizer, this may take a moment...", console=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "sentencepiece", "datasets", "huggingface_hub", "tqdm"], check=False)
+        subprocess.run([sys.executable, "data/cached_challenge_fineweb.py", "--variant", "sp1024"], check=True)
+    if distributed:
+        dist.barrier()
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

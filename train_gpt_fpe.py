@@ -825,8 +825,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True) # Fallback for older Colab GPUs (T4)
+    enable_math_sdp(True)          # Fallback for CPU/no-flash scenarios
 
     logfile = None
     if master_process:

@@ -1073,16 +1073,29 @@ def main() -> None:
                 )
             break
 
+        fpe_eligible = (has_expanded_count < max_expansions) and (step > 0)
+        # ensure we don't detonate in the last 20% of training to allow quantization to settle
+        if step > args.iterations * 0.8:
+            fpe_eligible = False
+            
+        should_track_fpe = fpe_eligible and (step % args.fpe_log_interval == 0)
+
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        h_states_cache = None
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                # Compute-aware D_PR tracking: grab states directly from the training forward pass!
+                if should_track_fpe and micro_step == grad_accum_steps - 1:
+                    loss, h_states = model(x, y, return_hidden=True)
+                    h_states_cache = h_states.detach()
+                else:
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1124,19 +1137,13 @@ def main() -> None:
             stop_after_step = step
 
         # FPE Dynamic Expansion Trigger
-        if has_expanded_count < max_expansions and step > 0 and step % args.fpe_log_interval == 0:
-            with torch.no_grad():
-                base_model.eval()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _, h_states = base_model(x, y, return_hidden=True)
-                base_model.train()
-                # Sample hidden states at the last layer
-                # h_states comes from the last encoder layer
-                h_seq = h_states.view(-1, h_states.size(-1))
-                h_sample = h_seq[torch.randperm(h_seq.size(0))[:2048]]
-                pr_dim = compute_pr_dim(h_sample).item()
-                dpr_stats.append(pr_dim)
-                log0(f"[FPE] Step {step} | D_PR: {pr_dim:.2f}")
+        if h_states_cache is not None:
+            # Sample hidden states at the last layer and track DPR overhead-free
+            h_seq = h_states_cache.view(-1, h_states_cache.size(-1))
+            h_sample = h_seq[torch.randperm(h_seq.size(0))[:2048]]
+            pr_dim = compute_pr_dim(h_sample).item()
+            dpr_stats.append(pr_dim)
+            log0(f"[FPE] Step {step} | D_PR: {pr_dim:.2f}")
 
             if len(dpr_stats) >= args.fpe_patience:
                 window = dpr_stats[-args.fpe_patience:]
@@ -1144,16 +1151,39 @@ def main() -> None:
                 if dpr_diff < args.fpe_tolerance:
                     log0(f"\n>>> [FPE TRIGGER] D_PR Plateaued (diff {dpr_diff:.2f}). Expanding FFN...")
                     has_expanded_count += 1
-                    for block in base_model.blocks:
+                    
+                    spliced_momentums = {}
+                    old_muon_state = { id(p): obj for p, obj in optimizer_muon.state.items() }
+
+                    for i, block in enumerate(base_model.blocks):
+                        old_fc_id = id(block.mlp.fc.weight)
+                        old_proj_id = id(block.mlp.proj.weight)
+                        
                         block.mlp.expand_ffn(n_children=2)
+                        
+                        # Momentum Splicing for Muon
+                        if old_fc_id in old_muon_state and "momentum_buffer" in old_muon_state[old_fc_id]:
+                            buf1 = old_muon_state[old_fc_id]["momentum_buffer"]
+                            buf2 = old_muon_state[old_proj_id]["momentum_buffer"]
+                            new_buf1, new_buf2 = split_ffn_neurons(buf1, buf2, n_children=2)
+                            spliced_momentums[i] = (new_buf1 * 0.5, new_buf2 * 2.0)
                     
                     # Rebuild optimizer
                     base_model = base_model.to(device).bfloat16()
                     restore_low_dim_params_to_fp32(base_model)
                     model = compile_model(base_model)
                     optimizers, optimizer_muon = build_optimizers(base_model)
+                    
+                    # Inject spliced momentum into newly built Muon state
+                    for i, block in enumerate(base_model.blocks):
+                        if i in spliced_momentums:
+                            m1, m2 = spliced_momentums[i]
+                            # match Muon gradient buffering dtype (bfloat16)
+                            optimizer_muon.state[block.mlp.fc.weight]["momentum_buffer"] = m1.to(device=device, dtype=torch.bfloat16)
+                            optimizer_muon.state[block.mlp.proj.weight]["momentum_buffer"] = m2.to(device=device, dtype=torch.bfloat16)
+
                     dpr_stats = [] # reset
-                    log0(">>> Geometric Detonation Complete.\n")
+                    log0(">>> Geometric Detonation Complete. Momentum state spliced.\n")
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

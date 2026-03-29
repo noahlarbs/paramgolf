@@ -261,7 +261,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -809,12 +809,13 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
+    if torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo", device_id=device if torch.cuda.is_available() else None)
         dist.barrier()
     master_process = rank == 0
 
@@ -1018,7 +1019,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1046,7 +1047,7 @@ def main() -> None:
     has_expanded_count = 0
     max_expansions = int(math.log2(args.d_ff_max / max(1, args.d_ff_base)))
     
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
@@ -1055,7 +1056,7 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
-            torch.cuda.synchronize()
+            if torch.cuda.is_available(): torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
@@ -1073,7 +1074,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            torch.cuda.synchronize()
+            if torch.cuda.is_available(): torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
@@ -1100,7 +1101,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
                 # Compute-aware D_PR tracking: grab states directly from the training forward pass!
                 if should_track_fpe and micro_step == grad_accum_steps - 1:
                     loss, h_states = model(x, y, return_hidden=True)
@@ -1239,7 +1240,7 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1253,7 +1254,7 @@ def main() -> None:
         has_leading_space_lut,
         is_boundary_token_lut,
     )
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"

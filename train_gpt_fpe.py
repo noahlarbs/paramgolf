@@ -73,9 +73,9 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     
     # FPE Hyperparameters
-    fpe_patience = int(os.environ.get("FPE_PATIENCE", 3))
-    fpe_log_interval = int(os.environ.get("FPE_LOG_INTERVAL", 200)) # Measure D_PR every N steps
-    fpe_tolerance = float(os.environ.get("FPE_TOLERANCE", 0.25))
+    fpe_patience = int(os.environ.get("FPE_PATIENCE", 4))
+    fpe_log_interval = int(os.environ.get("FPE_LOG_INTERVAL", 50)) # Measure D_PR every N steps
+    fpe_tolerance = float(os.environ.get("FPE_TOLERANCE", 0.05)) # Used as relative percent growth
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1152,16 +1152,26 @@ def main() -> None:
         if h_states_cache is not None:
             # Sample hidden states at the last layer and track DPR overhead-free
             h_seq = h_states_cache.view(-1, h_states_cache.size(-1))
-            h_sample = h_seq[torch.randperm(h_seq.size(0))[:2048]]
+            h_sample = h_seq[torch.randperm(h_seq.size(0))[:8192]] # Increased to 8192 for lower variance
             pr_dim = compute_pr_dim(h_sample).item()
-            dpr_stats.append(pr_dim)
-            log0(f"[FPE] Step {step} | D_PR: {pr_dim:.2f}")
+            
+            # Smooth D_PR with a moving average
+            if not dpr_stats:
+                smoothed_pr = pr_dim
+            else:
+                smoothed_pr = 0.3 * pr_dim + 0.7 * dpr_stats[-1]
+                
+            dpr_stats.append(smoothed_pr)
+            log0(f"[FPE] Step {step} | Raw D_PR: {pr_dim:.2f} | Smoothed: {smoothed_pr:.2f}")
 
             if len(dpr_stats) >= args.fpe_patience:
                 window = dpr_stats[-args.fpe_patience:]
-                dpr_diff = max(window) - min(window)
-                if dpr_diff < args.fpe_tolerance:
-                    log0(f"\n>>> [FPE TRIGGER] D_PR Plateaued (diff {dpr_diff:.2f}). Expanding FFN...")
+                # Measure geometric plateau via relative growth
+                dpr_growth = window[-1] - window[0]
+                relative_growth = dpr_growth / max(window[0], 1.0)
+                
+                if relative_growth < args.fpe_tolerance:
+                    log0(f"\n>>> [FPE TRIGGER] D_PR Plateaued (Relative Growth: {relative_growth*100:.2f}% < {args.fpe_tolerance*100:.2f}%). Expanding FFN...")
                     has_expanded_count += 1
                     
                     spliced_momentums = {}
@@ -1186,6 +1196,7 @@ def main() -> None:
                     
                     # Flush the PyTorch compiler cache so Dynamo learns the new FFN shapes from scratch
                     torch._dynamo.reset()
+                    torch.cuda.empty_cache() # Prevent VRAM fragmentation across dynamic sizes
                     
                     model = compile_model(base_model)
                     optimizers, optimizer_muon = build_optimizers(base_model)

@@ -1100,6 +1100,11 @@ def main() -> None:
                     bound = (1.0 / fan_in) ** 0.5
                     w1.data[indices] = torch.empty(num_recycle, fan_in, device=w1.device, dtype=w1.dtype).uniform_(-bound, bound)
                     w2.data[:, indices] = 0.0
+                    if w1.grad is not None:
+                        w1.grad.data[indices, :] = 0.0
+                    if w2.grad is not None:
+                        w2.grad.data[:, indices] = 0.0
+                        
                     grad_util_ema[i, indices] = grad_util_ema[i].mean()
                     
                     state_w1 = optimizer_muon.state.get(w1)
@@ -1111,7 +1116,10 @@ def main() -> None:
                         state_w2["momentum_buffer"][:, indices] = 0.0
 
         prune_start_step = int(args.iterations * args.prune_start_frac)
-        if step == prune_start_step and not has_pruned:
+        current_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        hit_wallclock_prune = (max_wallclock_ms is not None and current_ms >= max_wallclock_ms * args.prune_start_frac)
+        
+        if (step >= prune_start_step or hit_wallclock_prune) and not has_pruned:
             has_pruned = True
             log0(f"Starting structured pruning phase at step {step}")
             
@@ -1162,7 +1170,11 @@ def main() -> None:
                         with torch.no_grad():
                             w1.data[pruned_indices, :] = 0.0
                             w2.data[:, pruned_indices] = 0.0
-                            
+                            if w1.grad is not None:
+                                w1.grad.data[pruned_indices, :] = 0.0
+                            if w2.grad is not None:
+                                w2.grad.data[:, pruned_indices] = 0.0
+                                
                             state_w1 = optimizer_muon.state.get(w1)
                             if state_w1 and "momentum_buffer" in state_w1:
                                 state_w1["momentum_buffer"][pruned_indices, :] = 0.0

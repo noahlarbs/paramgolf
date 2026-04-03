@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9)) # competitive baseline uses 11 usually, but leaving default 9
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -317,6 +317,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILE = 99.98
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -425,6 +427,140 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+def pack_int6(values: Tensor) -> Tensor:
+    pad_len = (4 - (values.numel() % 4)) % 4
+    if pad_len > 0:
+        v = F.pad(values, (0, pad_len))
+    else:
+        v = values
+    v = (v + 31).to(torch.int32)
+    v = v.view(-1, 4)
+    a, b, c, d = v[:, 0], v[:, 1], v[:, 2], v[:, 3]
+    
+    byte0 = ((a << 2) | (b >> 4)).to(torch.uint8)
+    byte1 = (((b & 0x0F) << 4) | (c >> 2)).to(torch.uint8)
+    byte2 = (((c & 0x03) << 6) | d).to(torch.uint8)
+    
+    return torch.stack([byte0, byte1, byte2], dim=1).flatten()
+
+def unpack_int6(packed: Tensor, num_values: int) -> Tensor:
+    packed = packed.view(-1, 3).to(torch.int32)
+    byte0, byte1, byte2 = packed[:, 0], packed[:, 1], packed[:, 2]
+    
+    a = byte0 >> 2
+    b = ((byte0 & 0x03) << 4) | (byte1 >> 4)
+    c = ((byte1 & 0x0F) << 2) | (byte2 >> 6)
+    d = byte2 & 0x3F
+    
+    v = torch.stack([a, b, c, d], dim=1).flatten()
+    return (v[:num_values] - 31).to(torch.int8)
+
+def quantize_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor, int]:
+    t32 = t.float()
+    num_values = t.numel()
+    if t32.ndim == 2:
+        clip_abs = (
+            torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8)
+        packed = pack_int6(q.flatten())
+        return packed, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), num_values
+    
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT6_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8)
+    packed = pack_int6(q.flatten())
+    return packed, scale, num_values
+
+def dequantize_tensor_int6(packed: Tensor, scales: Tensor, shape: tuple, num_values: int) -> Tensor:
+    q = unpack_int6(packed, num_values).view(shape).float()
+    if scales.ndim > 0:
+        scales = scales.float()
+        return q * scales.view(shape[0], *([1] * (len(shape) - 1)))
+    else:
+        return q * float(scales.item())
+
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    shapes: dict[str, tuple] = {}
+    num_values_dict: dict[str, int] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int6_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int6_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        q_packed, s, num_vals = quantize_tensor_int6(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q_packed
+        scales[name] = s
+        shapes[name] = tuple(t.shape)
+        num_values_dict[name] = num_vals
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int6_payload_bytes"] += tensor_nbytes(q_packed) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "int6_packed_per_row_v1",
+        "packed": quantized,
+        "scales": scales,
+        "shapes": shapes,
+        "num_values": num_values_dict,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_state_dict_int6(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, packed in obj["packed"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        shape = obj["shapes"][name]
+        num_vals = obj["num_values"][name]
+        
+        out[name] = dequantize_tensor_int6(packed, s, shape, num_vals).to(dtype=dtype).contiguous()
+        
+    for name, t in obj["passthrough"].items():
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -1252,7 +1388,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int6(base_model.state_dict())
     quant_obj["d_ff_per_layer"] = d_ff_per_layer
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
@@ -1260,23 +1396,23 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int6.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int6_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model int6+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int6_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         total_size = quant_file_bytes + code_bytes
-        log0(f"Total submission size int8+zlib: {total_size} bytes")
+        log0(f"Total submission size int6+zlib: {total_size} bytes")
         if total_size > args.size_budget_bytes:
             log0(f"WARNING: Submission size {total_size} exceeds SIZE_BUDGET_BYTES {args.size_budget_bytes}!")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     
@@ -1297,7 +1433,7 @@ def main() -> None:
     for module in eval_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-    eval_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    eval_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
     eval_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     if distributed:
         eval_model = DDP(eval_model, device_ids=[local_rank], broadcast_buffers=False)
